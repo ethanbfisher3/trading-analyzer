@@ -117,6 +117,7 @@ def equity_curve(trades: pd.DataFrame, starting_balance: float = 0.0) -> go.Figu
 def daily_pnl_bars(trades: pd.DataFrame) -> go.Figure:
     df = daily_pnl(trades)
     df["date_dt"] = pd.to_datetime(df["date"])
+    df = df[df["date_dt"].dt.dayofweek < 5]  # drop Saturday (5) and Sunday (6)
     colors = [C["green"] if v >= 0 else C["red"] for v in df["daily_pnl"]]
 
     fig = go.Figure(go.Bar(
@@ -338,6 +339,7 @@ def month_calendar(trades: pd.DataFrame, year: int, month: int,
         margin=dict(l=6, r=6, t=46, b=6),
         showlegend=False,
         dragmode=False,
+        clickmode='event+select',
         hoverlabel=dict(
             bgcolor='#252640',
             bordercolor='#3C3D58',

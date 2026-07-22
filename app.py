@@ -242,9 +242,10 @@ def _fmt_pnl(v: float) -> str:
 
 # ── Import helper (runs once per unique file upload) ──────────────────────────
 
-def _import_file(file_bytes: bytes, filename: str) -> tuple[int, int]:
+def _import_file(file_bytes: bytes, filename: str, account_id: int) -> tuple[int, int]:
     """
-    Parse uploaded file, deduplicate against the DB, store only new orders.
+    Parse uploaded file, deduplicate against the DB for the given account,
+    and store only new orders.
     Returns (new_orders_added, duplicates_skipped).
     """
     ext = filename.rsplit(".", 1)[-1].lower()
@@ -254,33 +255,133 @@ def _import_file(file_bytes: bytes, filename: str) -> tuple[int, int]:
     orders = load_and_filter_orders(source, filename=filename)
     fingerprints = compute_fingerprints(orders)
 
-    known = db.get_known_fingerprints()
+    known = db.get_known_fingerprints(account_id)
     is_new = [fp not in known for fp in fingerprints]
     new_orders = orders[is_new].reset_index(drop=True)
     new_fps    = [fp for fp, n in zip(fingerprints, is_new) if n]
     dupes      = len(orders) - len(new_orders)
 
-    inserted = db.save_new_orders(new_orders, new_fps)
+    inserted = db.save_new_orders(new_orders, new_fps, account_id)
     return inserted, dupes
 
 
 # ── Load all trades from DB (cached, busted when new data arrives) ────────────
 
 @st.cache_data(show_spinner="Grouping trades…")
-def _load_trades(db_order_count: int) -> pd.DataFrame:
+def _load_trades(account_id: int, db_order_count: int) -> pd.DataFrame:
     """
-    Re-group every stored order into trades.
+    Re-group every stored order for an account into trades.
     db_order_count is used only as a cache key — changing it busts the cache.
     """
-    all_orders = db.load_all_orders()
+    all_orders = db.load_all_orders(account_id)
     if all_orders.empty:
         return pd.DataFrame()
     return group_orders_into_trades(all_orders)
 
 
+@st.cache_data(show_spinner=False)
+def _account_summary(account_id: int, db_order_count: int) -> dict:
+    """Small stat snapshot for an account, used in the account switcher."""
+    trades = _load_trades(account_id, db_order_count)
+    if trades.empty:
+        return {"trades": 0, "net_pnl": 0.0, "win_rate": 0.0}
+    kpis = calculate_kpis(trades)
+    return {
+        "trades": kpis["total_trades"],
+        "net_pnl": kpis["total_pnl"],
+        "win_rate": kpis["win_rate"],
+    }
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📈 Trade Journal")
+    st.divider()
+
+    # ── Accounts ─────────────────────────────────────────────────────────────
+    st.markdown("### Accounts")
+    accounts = db.list_accounts()
+    account_ids = [a["id"] for a in accounts]
+    account_names = {a["id"]: a["name"] for a in accounts}
+
+    if st.session_state.get("current_account_id") not in account_ids:
+        st.session_state["current_account_id"] = account_ids[0]
+
+    sel_account_id = st.selectbox(
+        "Active Account",
+        account_ids,
+        format_func=lambda aid: account_names[aid],
+        index=account_ids.index(st.session_state["current_account_id"]),
+    )
+    if sel_account_id != st.session_state["current_account_id"]:
+        st.session_state["current_account_id"] = sel_account_id
+        st.session_state.pop("last_imported", None)
+        st.session_state.pop("import_msg", None)
+        st.rerun()
+
+    current_account_id = st.session_state["current_account_id"]
+
+    # Quick glance stats for every account, so switching isn't required to compare.
+    for acc in accounts:
+        acc_orders = db.order_count(acc["id"])
+        stats = _account_summary(acc["id"], acc_orders)
+        active = acc["id"] == current_account_id
+        pnl_cls = "pos-text" if stats["net_pnl"] >= 0 else "neg-text"
+        marker = "●" if active else "○"
+        name_style = "color:#DCDCE4; font-weight:600;" if active else "color:#6B7080;"
+        st.markdown(
+            f"<div style='font-size:12px; padding:2px 0 2px 2px;'>"
+            f"{marker} <span style='{name_style}'>{acc['name']}</span>"
+            f"<span style='color:#6B7080;'> — {stats['trades']} trades · "
+            f"</span><span class='{pnl_cls}'>${stats['net_pnl']:,.2f}</span>"
+            f"<span style='color:#6B7080;'> · {stats['win_rate']:.0f}% WR</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("⚙️ Manage Accounts"):
+        new_acc_name = st.text_input("New account name", placeholder="e.g. Roth IRA",
+                                      key="new_account_name")
+        if st.button("➕ Add Account", use_container_width=True):
+            if new_acc_name.strip():
+                try:
+                    new_id = db.create_account(new_acc_name)
+                    st.session_state["current_account_id"] = new_id
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+            else:
+                st.warning("Enter a name first.")
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        rename_val = st.text_input(
+            "Rename active account", value=account_names[current_account_id],
+            key=f"rename_{current_account_id}",
+        )
+        if st.button("✏️ Rename", use_container_width=True):
+            if rename_val.strip() and rename_val.strip() != account_names[current_account_id]:
+                try:
+                    db.rename_account(current_account_id, rename_val)
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+        if len(accounts) > 1:
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            confirm_del = st.checkbox(
+                f"Confirm delete '{account_names[current_account_id]}' and all its trades",
+                key=f"confirm_del_{current_account_id}",
+            )
+            if st.button("🗑 Delete Active Account", type="secondary",
+                         use_container_width=True, disabled=not confirm_del):
+                db.delete_account(current_account_id)
+                st.session_state["current_account_id"] = db.list_accounts()[0]["id"]
+                st.session_state.pop("last_imported", None)
+                st.session_state.pop("import_msg", None)
+                st.cache_data.clear()
+                st.rerun()
+
     st.divider()
 
     uploaded = st.file_uploader(
@@ -291,15 +392,16 @@ with st.sidebar:
 
     # ── Process upload ────────────────────────────────────────────────────────
     if uploaded:
-        # Use (name, size) as a cheap session-level dedup key so we don't
-        # re-import the same file every time Streamlit reruns.
-        file_key = f"{uploaded.name}::{len(uploaded.getvalue())}"
+        # Use (name, size, account) as a cheap session-level dedup key so we
+        # don't re-import the same file every time Streamlit reruns.
+        file_key = f"{current_account_id}::{uploaded.name}::{len(uploaded.getvalue())}"
         if st.session_state.get("last_imported") != file_key:
             try:
                 with st.spinner("Importing…"):
-                    added, skipped = _import_file(uploaded.getvalue(), uploaded.name)
+                    added, skipped = _import_file(uploaded.getvalue(), uploaded.name, current_account_id)
                 st.session_state["last_imported"] = file_key
                 st.session_state["import_msg"] = (added, skipped)
+                st.cache_data.clear()
             except Exception as exc:
                 st.error(f"Import failed: {exc}")
                 st.exception(exc)
@@ -316,8 +418,8 @@ with st.sidebar:
     st.divider()
 
     # ── Starting balance ──────────────────────────────────────────────────────
-    st.markdown("### Account")
-    stored_balance = float(db.get_setting("starting_balance", "0"))
+    st.markdown("### Balance")
+    stored_balance = float(db.get_setting("starting_balance", "0", account_id=current_account_id))
     new_balance = st.number_input(
         "Starting Balance ($)",
         min_value=0.0,
@@ -327,18 +429,18 @@ with st.sidebar:
         help="Your account balance before the first trade. Used to show actual account value on the equity curve and calculate total return %.",
     )
     if new_balance != stored_balance:
-        db.save_setting("starting_balance", str(new_balance))
+        db.save_setting("starting_balance", str(new_balance), account_id=current_account_id)
         st.rerun()
 
     st.divider()
 
     # ── Stats & danger zone ───────────────────────────────────────────────────
-    n_orders = db.order_count()
+    n_orders = db.order_count(current_account_id)
     if n_orders > 0:
         st.caption(f"📦 {n_orders} orders stored in journal")
         if st.button("🗑 Clear All Data", type="secondary", use_container_width=True,
-                     help="Deletes all stored orders. Notes & tags are kept."):
-            db.clear_all_data()
+                     help="Deletes all stored orders for this account. Notes & tags are kept."):
+            db.clear_all_data(current_account_id)
             st.session_state.pop("last_imported", None)
             st.session_state.pop("import_msg", None)
             st.cache_data.clear()
@@ -351,13 +453,14 @@ with st.sidebar:
 
 
 # ── Load trades ───────────────────────────────────────────────────────────────
-n_orders = db.order_count()
+n_orders = db.order_count(current_account_id)
 
 if n_orders == 0:
-    st.markdown("""
+    st.markdown(f"""
 # 📈 Trade Journal & Analytics Dashboard
 
-Upload your **Webull order history** in the sidebar to begin.
+Upload your **Webull order history** in the sidebar to begin — you're viewing
+the **{account_names[current_account_id]}** account.
 
 | View | Contents |
 |---|---|
@@ -377,7 +480,7 @@ and skipped automatically.*
     """)
     st.stop()
 
-trades_df = _load_trades(n_orders)
+trades_df = _load_trades(current_account_id, n_orders)
 
 if trades_df is None or trades_df.empty:
     st.warning("Orders are stored but no completed round-trip trades were found yet. "
@@ -417,7 +520,7 @@ if fdf.empty:
     st.stop()
 
 kpis = calculate_kpis(fdf)
-starting_balance = float(db.get_setting("starting_balance", "0"))
+starting_balance = float(db.get_setting("starting_balance", "0", account_id=current_account_id))
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -509,7 +612,8 @@ with tab_analytics:
         "Worst Trade": sym["worst_trade"].map(_fmt_pnl),
         "Volume":      sym["total_volume"].map(lambda x: f"{x:,.0f}"),
     })
-    st.dataframe(sym_display, use_container_width=True, hide_index=True)
+    sym_table_height = 38 + 35 * len(sym_display) + 3
+    st.dataframe(sym_display, use_container_width=True, hide_index=True, height=sym_table_height)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -638,8 +742,6 @@ with tab_journal:
 # TAB 4 · YEAR VIEW
 # ════════════════════════════════════════════════════════════════════════════
 with tab_year:
-    from streamlit_plotly_events import plotly_events
-
     all_years = sorted(trades_df["exit_time"].dt.year.unique(), reverse=True)
     if len(all_years) > 1:
         sel_year = int(st.selectbox("Year", all_years, key="year_sel"))
@@ -663,7 +765,7 @@ with tab_year:
 
     st.caption("Click any green or red day to see that day's trades.")
 
-    # ── 4 rows × 3 columns — plotly_events captures actual point clicks ───────
+    # ── 4 rows × 3 columns — native st.plotly_chart with on_select ───────────
     clicked_date: datetime.date | None = None
 
     for row_months in ([1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]):
@@ -675,15 +777,14 @@ with tab_year:
                     p90=year_p90,
                     highlight_date=highlight_date,
                 )
-                click_data = plotly_events(
+                result = st.plotly_chart(
                     fig,
-                    click_event=True,
-                    override_height=280,
-                    override_width="100%",
+                    use_container_width=True,
+                    on_select="rerun",
                     key=f"cal_{sel_year}_{month}",
                 )
-                if click_data and clicked_date is None:
-                    raw = click_data[0].get("customdata")
+                if clicked_date is None and result and result.selection.points:
+                    raw = result.selection.points[0].get("customdata")
                     if isinstance(raw, list):
                         raw = raw[0] if raw else None
                     if raw:

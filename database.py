@@ -17,25 +17,39 @@ import pandas as pd
 DB_PATH = Path(__file__).parent / "trade_journal.db"
 
 
+DEFAULT_ACCOUNT_ID = 1
+
+
 def init_db() -> None:
-    """Create all tables if they don't exist yet."""
+    """Create all tables if they don't exist yet, and migrate older schemas."""
     with _connect() as conn:
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL UNIQUE,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+                account_id INTEGER NOT NULL DEFAULT 1,
+                key        TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                PRIMARY KEY (account_id, key)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
-                fingerprint  TEXT PRIMARY KEY,
+                account_id   INTEGER NOT NULL DEFAULT 1,
+                fingerprint  TEXT NOT NULL,
                 symbol       TEXT NOT NULL,
                 ticker_type  TEXT NOT NULL DEFAULT 'EQUITY',
                 side         TEXT NOT NULL,
                 filled_qty   REAL NOT NULL,
                 filled_price REAL NOT NULL,
                 filled_time  TEXT NOT NULL,
-                imported_at  TEXT DEFAULT (datetime('now'))
+                imported_at  TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (account_id, fingerprint)
             )
         """)
         conn.execute("""
@@ -47,40 +61,158 @@ def init_db() -> None:
             )
         """)
 
+        _migrate_legacy_schema(conn)
+
+        if conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO accounts (id, name) VALUES (?, ?)",
+                (DEFAULT_ACCOUNT_ID, "Default"),
+            )
+
+
+def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+    """
+    Upgrade databases created before multi-account support:
+    old `orders`/`settings` tables had no account_id column and used a
+    single-column primary key. Rebuild them under the new composite-key
+    schema, assigning all existing rows to the Default account (id=1).
+    """
+    orders_cols = {r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+    if orders_cols and "account_id" not in orders_cols:
+        conn.execute("ALTER TABLE orders RENAME TO orders_old")
+        conn.execute("""
+            CREATE TABLE orders (
+                account_id   INTEGER NOT NULL DEFAULT 1,
+                fingerprint  TEXT NOT NULL,
+                symbol       TEXT NOT NULL,
+                ticker_type  TEXT NOT NULL DEFAULT 'EQUITY',
+                side         TEXT NOT NULL,
+                filled_qty   REAL NOT NULL,
+                filled_price REAL NOT NULL,
+                filled_time  TEXT NOT NULL,
+                imported_at  TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (account_id, fingerprint)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO orders (account_id, fingerprint, symbol, ticker_type,
+                                 side, filled_qty, filled_price, filled_time, imported_at)
+            SELECT 1, fingerprint, symbol, ticker_type, side, filled_qty,
+                   filled_price, filled_time, imported_at
+            FROM orders_old
+        """)
+        conn.execute("DROP TABLE orders_old")
+        if conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO accounts (id, name) VALUES (?, ?)",
+                (DEFAULT_ACCOUNT_ID, "Default"),
+            )
+
+    settings_cols = {r[1] for r in conn.execute("PRAGMA table_info(settings)").fetchall()}
+    if settings_cols and "account_id" not in settings_cols:
+        conn.execute("ALTER TABLE settings RENAME TO settings_old")
+        conn.execute("""
+            CREATE TABLE settings (
+                account_id INTEGER NOT NULL DEFAULT 1,
+                key        TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                PRIMARY KEY (account_id, key)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO settings (account_id, key, value)
+            SELECT 1, key, value FROM settings_old
+        """)
+        conn.execute("DROP TABLE settings_old")
+
 
 # ---------------------------------------------------------------------------
-# Settings (key-value persistence)
+# Accounts
 # ---------------------------------------------------------------------------
 
-def get_setting(key: str, default: str = "") -> str:
+def list_accounts() -> list[dict]:
+    """Return all accounts as [{id, name, created_at}, ...], oldest first."""
     with _connect() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        rows = conn.execute(
+            "SELECT id, name, created_at FROM accounts ORDER BY id"
+        ).fetchall()
+    return [{"id": r[0], "name": r[1], "created_at": r[2]} for r in rows]
+
+
+def create_account(name: str) -> int:
+    """Create a new account and return its id. Raises ValueError on duplicate name."""
+    name = name.strip()
+    if not name:
+        raise ValueError("Account name cannot be empty.")
+    with _connect() as conn:
+        try:
+            cur = conn.execute("INSERT INTO accounts (name) VALUES (?)", (name,))
+        except sqlite3.IntegrityError:
+            raise ValueError(f"An account named '{name}' already exists.")
+        return cur.lastrowid
+
+
+def rename_account(account_id: int, new_name: str) -> None:
+    new_name = new_name.strip()
+    if not new_name:
+        raise ValueError("Account name cannot be empty.")
+    with _connect() as conn:
+        try:
+            conn.execute("UPDATE accounts SET name = ? WHERE id = ?", (new_name, account_id))
+        except sqlite3.IntegrityError:
+            raise ValueError(f"An account named '{new_name}' already exists.")
+
+
+def delete_account(account_id: int) -> None:
+    """Delete an account and all of its orders/settings. Cannot delete the last account."""
+    with _connect() as conn:
+        n_accounts = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        if n_accounts <= 1:
+            raise ValueError("Cannot delete the only remaining account.")
+        conn.execute("DELETE FROM orders WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM settings WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+
+
+# ---------------------------------------------------------------------------
+# Settings (key-value persistence, scoped per account)
+# ---------------------------------------------------------------------------
+
+def get_setting(key: str, default: str = "", account_id: int = DEFAULT_ACCOUNT_ID) -> str:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE account_id = ? AND key = ?",
+            (account_id, key),
+        ).fetchone()
     return row[0] if row else default
 
 
-def save_setting(key: str, value: str) -> None:
+def save_setting(key: str, value: str, account_id: int = DEFAULT_ACCOUNT_ID) -> None:
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
+            "INSERT INTO settings (account_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value",
+            (account_id, key, value),
         )
 
 
 # ---------------------------------------------------------------------------
-# Order persistence (deduplication)
+# Order persistence (deduplication, scoped per account)
 # ---------------------------------------------------------------------------
 
-def get_known_fingerprints() -> set[str]:
-    """Return the set of all order fingerprints already stored."""
+def get_known_fingerprints(account_id: int = DEFAULT_ACCOUNT_ID) -> set[str]:
+    """Return the set of all order fingerprints already stored for an account."""
     with _connect() as conn:
-        rows = conn.execute("SELECT fingerprint FROM orders").fetchall()
+        rows = conn.execute(
+            "SELECT fingerprint FROM orders WHERE account_id = ?", (account_id,)
+        ).fetchall()
     return {r[0] for r in rows}
 
 
-def save_new_orders(orders_df: pd.DataFrame, fingerprints: list[str]) -> int:
+def save_new_orders(orders_df: pd.DataFrame, fingerprints: list[str],
+                     account_id: int = DEFAULT_ACCOUNT_ID) -> int:
     """
-    Insert rows for orders we haven't seen before.
+    Insert rows for orders we haven't seen before, under the given account.
     orders_df must have columns: Symbol, Ticker Type, Side, Filled Qty,
                                   Filled Price, Filled Time.
     Returns the number of rows actually inserted.
@@ -91,6 +223,7 @@ def save_new_orders(orders_df: pd.DataFrame, fingerprints: list[str]) -> int:
     rows = []
     for fp, (_, row) in zip(fingerprints, orders_df.iterrows()):
         rows.append((
+            account_id,
             fp,
             str(row["Symbol"]),
             str(row.get("Ticker Type", "EQUITY")),
@@ -104,8 +237,8 @@ def save_new_orders(orders_df: pd.DataFrame, fingerprints: list[str]) -> int:
         conn.executemany(
             """
             INSERT OR IGNORE INTO orders
-                (fingerprint, symbol, ticker_type, side, filled_qty, filled_price, filled_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (account_id, fingerprint, symbol, ticker_type, side, filled_qty, filled_price, filled_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -116,15 +249,16 @@ def save_new_orders(orders_df: pd.DataFrame, fingerprints: list[str]) -> int:
     return inserted
 
 
-def load_all_orders() -> pd.DataFrame:
+def load_all_orders(account_id: int = DEFAULT_ACCOUNT_ID) -> pd.DataFrame:
     """
-    Return every stored order as a DataFrame ready for group_orders_into_trades().
-    Columns match what the data_processor expects.
+    Return every stored order for an account as a DataFrame ready for
+    group_orders_into_trades(). Columns match what data_processor expects.
     """
     with _connect() as conn:
         rows = conn.execute(
             "SELECT symbol, ticker_type, side, filled_qty, filled_price, filled_time "
-            "FROM orders ORDER BY filled_time"
+            "FROM orders WHERE account_id = ? ORDER BY filled_time",
+            (account_id,),
         ).fetchall()
 
     if not rows:
@@ -139,15 +273,17 @@ def load_all_orders() -> pd.DataFrame:
     return df.dropna(subset=["Filled Time"]).sort_values("Filled Time").reset_index(drop=True)
 
 
-def order_count() -> int:
+def order_count(account_id: int = DEFAULT_ACCOUNT_ID) -> int:
     with _connect() as conn:
-        return conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        return conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE account_id = ?", (account_id,)
+        ).fetchone()[0]
 
 
-def clear_all_data() -> None:
-    """Delete all stored orders. Notes/tags are kept."""
+def clear_all_data(account_id: int = DEFAULT_ACCOUNT_ID) -> None:
+    """Delete all stored orders for an account. Notes/tags are kept."""
     with _connect() as conn:
-        conn.execute("DELETE FROM orders")
+        conn.execute("DELETE FROM orders WHERE account_id = ?", (account_id,))
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,2 @@
+On year view, all of the months are currently in vertical scrollviews but I don't want that
+The 'account balance' graph on the overview page should have points by the day, not by the specific time of the trade, because that makes it look really choppy
